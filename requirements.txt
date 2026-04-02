@@ -1,0 +1,5 @@
+duckdb
+polars
+pandas
+matplotlib
+plotly
