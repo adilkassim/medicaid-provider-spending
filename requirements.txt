@@ -3,3 +3,5 @@ polars
 pandas
 matplotlib
 plotly
+streamlit
+st-pages
