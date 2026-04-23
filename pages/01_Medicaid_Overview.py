@@ -1,6 +1,5 @@
 import os
-
-import duckdb
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -12,102 +11,17 @@ st.set_page_config(
     layout="wide",
 )
 
-default_parquet = os.path.expanduser("~/Downloads/medicaid-provider-spending.parquet")
-parquet_path = st.sidebar.text_input("Medicaid parquet path", value=default_parquet)
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 
-@st.cache_resource(show_spinner=False)
-def get_connection() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect("medicaid_app.duckdb")
-    con.execute("PRAGMA threads=8")
-    con.execute("PRAGMA enable_progress_bar=false")
-    return con
-
-
-def sql_literal(value: str) -> str:
-    escaped = value.replace("'", "''")
-    return f"'{escaped}'"
+def _csv(name: str) -> str:
+    return os.path.join(DATA_DIR, name)
 
 
 @st.cache_data(show_spinner=False)
-def prepare_data(path: str) -> None:
-    con = get_connection()
-    parquet_literal = sql_literal(path)
-    con.execute(
-        f"CREATE OR REPLACE VIEW medicaid AS SELECT * FROM read_parquet({parquet_literal})"
-    )
-
-    con.execute(
-        """
-        CREATE OR REPLACE TABLE agg_summary AS
-        SELECT
-            COUNT(*) AS total_rows,
-            SUM(TOTAL_PAID) AS total_spend,
-            SUM(TOTAL_CLAIMS) AS total_claims,
-            COUNT(DISTINCT BILLING_PROVIDER_NPI_NUM) AS distinct_billing_npi,
-            COUNT(DISTINCT SERVICING_PROVIDER_NPI_NUM) AS distinct_servicing_npi,
-            COUNT(DISTINCT HCPCS_CODE) AS unique_services
-        FROM medicaid
-        """
-    )
-
-    con.execute(
-        """
-        CREATE OR REPLACE TABLE agg_year AS
-        SELECT
-            SUBSTR(CAST(CLAIM_FROM_MONTH AS VARCHAR), 1, 4) AS year,
-            SUM(TOTAL_PAID) AS total_paid,
-            COUNT(DISTINCT BILLING_PROVIDER_NPI_NUM) AS distinct_billing_npi,
-            COUNT(DISTINCT SERVICING_PROVIDER_NPI_NUM) AS distinct_servicing_npi
-        FROM medicaid
-        GROUP BY 1
-        ORDER BY 1
-        """
-    )
-
-    con.execute(
-        """
-        CREATE OR REPLACE TABLE agg_hcpcs AS
-        SELECT
-            HCPCS_CODE,
-            SUM(TOTAL_CLAIMS) AS total_claims,
-            SUM(TOTAL_PAID) AS total_paid
-        FROM medicaid
-        WHERE HCPCS_CODE IS NOT NULL
-        GROUP BY HCPCS_CODE
-        """
-    )
-
-
-@st.cache_data(show_spinner=False)
-def load_columns(path: str) -> list[str]:
-    con = get_connection()
-    cols_df = con.execute(
-        """
-        SELECT column_name
-        FROM (DESCRIBE SELECT * FROM medicaid)
-        ORDER BY column_name
-        """,
-    ).df()
-    return cols_df["column_name"].tolist()
-
-
-@st.cache_data(show_spinner=False)
-def load_summary(_: str) -> dict:
-    con = get_connection()
-    summary_df = con.execute(
-        """
-        SELECT
-            total_rows,
-            total_spend,
-            total_claims,
-            distinct_billing_npi,
-            distinct_servicing_npi,
-            unique_services
-        FROM agg_summary
-        """
-    ).df()
-    row = summary_df.iloc[0]
+def load_summary() -> dict:
+    df = pd.read_csv(_csv("summary_stats.csv"), index_col=0)
+    row = df.iloc[0]
     return {
         "total_rows": int(row["total_rows"]),
         "total_spend": float(row["total_spend"]),
@@ -117,40 +31,46 @@ def load_summary(_: str) -> dict:
         "unique_services": int(row["unique_services"]),
     }
 
+@st.cache_data(show_spinner=False)
+def load_spend_by_month() -> pd.DataFrame:
+    df = pd.read_csv(_csv("per_month.csv"), index_col=0)
+    df["CLAIM_FROM_MONTH"] = df["CLAIM_FROM_MONTH"].astype(str)
+    df.rename(columns={"CLAIM_FROM_MONTH": "date"}, inplace=True)
+
+    return df
 
 @st.cache_data(show_spinner=False)
-def load_spend_by_year(_: str):
-    con = get_connection()
-    return con.execute("SELECT * FROM agg_year").df()
+def load_columns() -> list[str]:
+    df = pd.read_csv(_csv("columns.csv"), index_col=0)
+    return df["column_name"].tolist()
 
 
 @st.cache_data(show_spinner=False)
-def load_hcpcs_rollup(_: str, metric: str, top_n: int):
+def load_spend_by_year():
+    return pd.read_csv(_csv("agg_year.csv"), index_col=0)
+
+
+@st.cache_data(show_spinner=False)
+def load_hcpcs_rollup(metric: str, top_n: int):
     if metric not in {"total_claims", "total_paid"}:
         raise ValueError("Invalid metric")
-
-    con = get_connection()
-    query = f"""
-        SELECT
-            HCPCS_CODE,
-            total_claims,
-            total_paid
-        FROM agg_hcpcs
-        ORDER BY {metric} DESC
-        LIMIT ?
-    """
-    return con.execute(query, [top_n]).df()
+    df = pd.read_csv(_csv("hcpcs.csv"), index_col=0)
+    return df.nlargest(top_n, metric)[["HCPCS_CODE", "total_claims", "total_paid"]]
 
 
-if not os.path.exists(parquet_path):
-    st.error(f"File not found: {parquet_path}")
+st.title("Medicaid Spending")
+
+required = ["summary_stats.csv", "agg_year.csv", "hcpcs.csv", "columns.csv"]
+missing = [f for f in required if not os.path.exists(_csv(f))]
+if missing:
+    st.error(f"Missing data files: {missing}. Run page_1_data.py first.")
     st.stop()
 
 with st.spinner("Loading overview metrics..."):
-    prepare_data(parquet_path)
-    columns = load_columns(parquet_path)
-    summary = load_summary(parquet_path)
-    spend_by_year = load_spend_by_year(parquet_path)
+    summary = load_summary()
+    columns = load_columns()
+    spend_by_month = load_spend_by_month()
+    spend_by_year = load_spend_by_year()
 
 metrics = st.columns(7)
 metrics[0].metric("Total Spend", f"${float(summary['total_spend']):,.0f}")
@@ -166,30 +86,85 @@ metrics[5].metric("Unique HCPCS codes", f"{int(summary['unique_services']):,}")
 metrics[6].metric("Total Claims", f"{float(summary['total_claims']):,.0f}")
 
 st.markdown("## Provider Spend by Year")
-chart_type = st.radio("Chart type", options=["Bar", "Line"], horizontal=True)
-if chart_type == "Line":
-    fig_year = px.line(
-        spend_by_year,
-        x="year",
-        y="total_paid",
-        markers=True,
-        title="Total Medicaid Spend by Year",
-        labels={"year": "Year", "total_paid": "Total Paid ($)"},
-    )
-else:
-    fig_year = px.bar(
-        spend_by_year,
-        x="year",
-        y="total_paid",
-        title="Total Medicaid Spend by Year",
-        labels={"year": "Year", "total_paid": "Total Paid ($)"},
-    )
-st.plotly_chart(fig_year, use_container_width=True)
+st.caption("Click a year bar to see the monthly breakdown.")
 
-st.markdown("### Total payments by year (billing NPI on claim rows)")
-st.caption(
-    "TOTAL_PAID summed by year. Lines show COUNT(DISTINCT …) per year for the two NPI columns on the file."
-)
+col_year, col_month = st.columns(2)
+
+with col_year:
+    fig_by_year = px.bar(
+        spend_by_year,
+        x="year",
+        y="total_paid",
+        title="Total Spend by Year",
+        labels={"year": "Year", "total_paid": "Total Paid ($)"},
+        color_discrete_sequence=["#636EFA"],
+    )
+    fig_by_year.add_hline(
+        y=spend_by_year["total_paid"].mean(),
+        line=dict(color="red", dash="dash", width=1),
+        annotation_text=f"Avg: ${spend_by_year['total_paid'].mean() / 1e9:.1f}B",
+        annotation_position="top left",
+    )
+    fig_by_year.update_layout(clickmode="event+select")
+    year_event = st.plotly_chart(fig_by_year, use_container_width=True, on_select="rerun", selection_mode="points")
+
+selected_year = None
+if year_event and year_event.selection and year_event.selection.points:
+    selected_year = str(year_event.selection.points[0]["x"])
+
+with col_month:
+    if selected_year:
+        month_df = spend_by_month[spend_by_month["date"].str.startswith(selected_year)].sort_values("date")
+        month_dates = month_df["date"].tolist()
+        month_billions = month_df["total_paid"] / 1e9
+        avg = month_billions.mean()
+
+        chart_type = st.radio("Chart type", ["Bar", "Line"], horizontal=True, key="month_chart_type")
+
+        if chart_type == "Bar":
+            fig_month = px.bar(
+                month_df,
+                x="date",
+                y="total_paid",
+                title=f"Monthly Spend — {selected_year}",
+                labels={"date": "Month", "total_paid": "Total Paid ($)"},
+                color_discrete_sequence=["#636EFA"],
+            )
+            fig_month.add_hline(
+                y=month_df["total_paid"].mean(),
+                line=dict(color="red", dash="dash", width=1),
+                annotation_text=f"Avg: ${avg:.1f}B",
+                annotation_position="top right",
+            )
+        else:
+            fig_month = go.Figure()
+            fig_month.add_trace(go.Scatter(
+                x=month_dates,
+                y=month_billions,
+                mode="lines+markers",
+                fill="tozeroy",
+                fillcolor="rgba(99, 110, 250, 0.3)",
+                line=dict(color="#636EFA"),
+                name="Total Paid",
+            ))
+            fig_month.add_hline(
+                y=avg,
+                line=dict(color="red", dash="dash", width=1),
+                annotation_text=f"Avg: ${avg:.1f}B",
+                annotation_position="top right",
+            )
+            fig_month.update_layout(
+                title=f"Monthly Spend — {selected_year}",
+                xaxis=dict(tickangle=45),
+                yaxis=dict(title="Total Paid (Billions $)"),
+            )
+
+        st.plotly_chart(fig_month, use_container_width=True)
+    else:
+        st.info("Click a year on the left to see monthly breakdown.")
+
+st.markdown("### Distinct NPI counts by year")
+st.caption("Lines show COUNT(DISTINCT …) per year for the two NPI columns on the file.")
 fig_billing = make_subplots(specs=[[{"secondary_y": True}]])
 fig_billing.add_trace(
     go.Bar(
@@ -251,12 +226,10 @@ with ctrl3:
 metric = metric_map[metric_label]
 
 with st.spinner("Loading HCPCS rollup..."):
-    hcpcs_df = load_hcpcs_rollup(parquet_path, metric, top_n)
+    hcpcs_df = load_hcpcs_rollup(metric, top_n)
 
-# Plotly treats numeric-looking codes (e.g. 99213) as continuous unless they are strings.
 plot_df = hcpcs_df.copy()
 plot_df["HCPCS_CODE"] = plot_df["HCPCS_CODE"].astype(str)
-# Horizontal bars: ascending metric puts the largest bar at the top of the chart.
 plot_df = plot_df.sort_values(metric, ascending=True)
 
 fig_codes = px.bar(
@@ -277,7 +250,6 @@ fig_codes.update_layout(
 fig_codes.update_xaxes(title=metric_label)
 if log_scale:
     if metric == "total_paid":
-        # Reversals can be negative; symlog handles signed values better than log.
         fig_codes.update_xaxes(type="symlog", title=f"{metric_label} (symlog)")
     else:
         fig_codes.update_xaxes(type="log", title=f"{metric_label} (log)")
